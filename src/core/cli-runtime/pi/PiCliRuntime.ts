@@ -1,6 +1,10 @@
-import type { App } from 'obsidian'
+import { type App, Notice } from 'obsidian'
 
-import type { ToolCallResponse } from '../../../types/tool-call.types'
+import type { ChatToolMessage } from '../../../types/chat'
+import {
+  type ToolCallResponse,
+  ToolCallResponseStatus,
+} from '../../../types/tool-call.types'
 import { loadDesktopNodeModule } from '../../../utils/platform/desktopNodeModule'
 import { getCliPathOverride } from '../cli-path-override'
 import { loadLoginShellEnvironment } from '../login-shell-env'
@@ -25,6 +29,18 @@ import type {
 
 import type { PiRuntimeDialect } from './dialect'
 import { PI_RUNTIME_DIALECT } from './dialect'
+import {
+  type PiExtensionUiDialog,
+  type PiExtensionUiQuestion,
+  buildPiExtensionUiApprovalMessages,
+  buildPiExtensionUiQuestion,
+  buildPiExtensionUiQuestionMessages,
+  parsePiExtensionUiDialog,
+  parsePiExtensionUiNotification,
+  resolvePiExtensionUiAnswer,
+  settlePiExtensionUiCard,
+  toPiExtensionUiCancelResponse,
+} from './extension-ui'
 import {
   type PiMappingState,
   buildPiForkSessionContent,
@@ -55,6 +71,17 @@ export type PiCliRuntimeOptions = {
    * omp fork passes its own dialect (see `PiRuntimeDialect`).
    */
   dialect?: PiRuntimeDialect
+}
+
+/**
+ * One extension dialog pi is blocked on. `card` is kept exactly as published
+ * so a timeout can settle that same message without rebuilding it.
+ */
+type PendingPiExtensionUi = {
+  dialog: PiExtensionUiDialog
+  question: PiExtensionUiQuestion | null
+  card: ChatToolMessage
+  timeout: ReturnType<typeof globalThis.setTimeout> | null
 }
 
 type PiProcessHandle = {
@@ -98,6 +125,11 @@ export class PiCliRuntime implements CliRuntime {
    */
   private turnStartedAt: number | null = null
   private readonly mappingState: PiMappingState
+  /**
+   * Dialogs pi is blocked on right now, keyed by pi's request id — which is
+   * also the card's tool call id, so the host's answer routes straight back.
+   */
+  private readonly pendingExtensionUi = new Map<string, PendingPiExtensionUi>()
   private readonly listeners = new Set<CliRuntimeEventListener>()
   private models: CliRuntimeModel[] | null = null
   private modelId: string | null = null
@@ -273,7 +305,9 @@ export class PiCliRuntime implements CliRuntime {
    * No-op: pi has no native approval gate to hot-reconfigure (only a coarse
    * `--tools` allowlist, deliberately not implemented in v1 — see master
    * decision record), so the product's chat-mode/yolo toggle has nothing to
-   * apply here.
+   * apply here. The dialogs extensions raise are answered by the human even in
+   * YOLO mode: `approve_for_session` would be our guess at an extension's
+   * scope, and a `select` has no safe automatic answer at all.
    */
   async updatePermissionProfile(
     _update: CliPermissionProfileUpdate,
@@ -482,6 +516,13 @@ export class PiCliRuntime implements CliRuntime {
   }
 
   async cancel(): Promise<void> {
+    // A dialog pi is blocked on belongs to the turn: aborting while one is on
+    // screen has to release it, or the extension would keep waiting for an
+    // answer to a turn that is already over.
+    for (const id of [...this.pendingExtensionUi.keys()]) {
+      this.sendExtensionUiResponse(toPiExtensionUiCancelResponse(id))
+    }
+    this.clearPendingExtensionUi()
     if (!this.activeHandle) return
     this.cancelRequested = true
     // Fire-and-forget: pi's abort ack may race the process tearing down the
@@ -496,18 +537,64 @@ export class PiCliRuntime implements CliRuntime {
     await this.activeHandle.transport.request('compact', {}, 0)
   }
 
-  /** pi has no approval prompts in v1 — nothing is ever pending to answer. */
+  /**
+   * `confirm` is the only dialog pi accepts a boolean for. `approve_for_session`
+   * has no pi counterpart — a pi extension owns its own scope, and a grant it
+   * wants to remember is pi's to persist — so a session-scoped approval answers
+   * exactly like a one-off one here.
+   */
   async respondApproval(
-    _response: CliApprovalResponse,
+    response: CliApprovalResponse,
   ): Promise<ToolCallResponse | null> {
-    return null
+    const pending = this.pendingExtensionUi.get(response.requestId)
+    if (!pending || pending.dialog.method !== 'confirm') return null
+    this.clearExtensionUi(response.requestId)
+    const approved = response.decision !== 'reject'
+    this.sendExtensionUiResponse({
+      type: 'extension_ui_response',
+      id: pending.dialog.id,
+      confirmed: approved,
+    })
+    // Nothing follows a dialog in pi's event stream, so an approval is a
+    // finished card rather than a `Running` call that would never end.
+    return approved
+      ? {
+          status: ToolCallResponseStatus.Success,
+          data: { type: 'text', text: '' },
+        }
+      : { status: ToolCallResponseStatus.Rejected }
   }
 
-  /** pi has no user-question prompts in v1 — nothing is ever pending to answer. */
   async respondQuestion(
-    _response: CliQuestionResponse,
+    response: CliQuestionResponse,
   ): Promise<ToolCallResponse | null> {
-    return null
+    const pending = this.pendingExtensionUi.get(response.requestId)
+    if (!pending?.question) return null
+    this.clearExtensionUi(response.requestId)
+    if (response.answer === null || response.answer === undefined) {
+      this.sendExtensionUiResponse(
+        toPiExtensionUiCancelResponse(pending.dialog.id),
+      )
+      return { status: ToolCallResponseStatus.Rejected }
+    }
+    const resolved = resolvePiExtensionUiAnswer(
+      pending.question,
+      response.answer,
+    )
+    if (!resolved.ok) {
+      // Not an answer to *this* dialog. Release the extension instead of
+      // handing it a value it would misread as a real choice.
+      this.sendExtensionUiResponse(
+        toPiExtensionUiCancelResponse(pending.dialog.id),
+      )
+      return { status: ToolCallResponseStatus.Rejected }
+    }
+    this.sendExtensionUiResponse({
+      type: 'extension_ui_response',
+      id: pending.dialog.id,
+      value: resolved.value,
+    })
+    return resolved.settled
   }
 
   subscribe(listener: CliRuntimeEventListener): () => void {
@@ -571,6 +658,9 @@ export class PiCliRuntime implements CliRuntime {
     this.activeHandle = null
     this.detachActiveListeners?.()
     this.detachActiveListeners = null
+    // The dialogs die with the process they belong to, and their timers would
+    // otherwise outlive it.
+    this.clearPendingExtensionUi()
     if (handle) await this.disposeProcessHandle(handle)
   }
 
@@ -616,6 +706,19 @@ export class PiCliRuntime implements CliRuntime {
     if (!this.receivedFirstEvent) {
       this.receivedFirstEvent = true
       if (!this.sessionBound) void this.attemptBindSession()
+    }
+
+    // An extension waiting on the human is not a transcript event: it is a
+    // blocking request pi will not move past until it gets an answer.
+    const dialog = parsePiExtensionUiDialog(event)
+    if (dialog) {
+      this.presentExtensionUiDialog(dialog)
+      return
+    }
+    const notification = parsePiExtensionUiNotification(event)
+    if (notification) {
+      new Notice(notification)
+      return
     }
 
     const errorMessage = getPiTerminalErrorMessage(event)
@@ -685,6 +788,82 @@ export class PiCliRuntime implements CliRuntime {
    * awaited by the caller, so a bounded retry gives pi a real chance to
    * materialize the session before giving up.
    */
+  /**
+   * Publishes one card per dialog. `confirm` is a yes/no decision and keeps the
+   * host's approval card; `select`/`input`/`editor` are questions and use the
+   * ask-user panel, because every one of their answers is a legal outcome —
+   * reading an approval out of a `select` would answer with an option the human
+   * never picked.
+   */
+  private presentExtensionUiDialog(dialog: PiExtensionUiDialog): void {
+    const question =
+      dialog.method === 'confirm' ? null : buildPiExtensionUiQuestion(dialog)
+    const [assistant, card] = question
+      ? buildPiExtensionUiQuestionMessages(dialog, question, this.runtimeId)
+      : buildPiExtensionUiApprovalMessages(dialog, this.runtimeId)
+    this.trackExtensionUi(dialog, question, card)
+    this.emit({ type: 'message_upsert', message: assistant })
+    this.emit({ type: 'message_upsert', message: card })
+  }
+
+  /**
+   * pi resolves a timed dialog on its own the moment `timeout` elapses — with
+   * no value for select/input/editor and `false` for confirm — so the card has
+   * to settle by itself too. Otherwise it would sit there waiting for an answer
+   * pi has already given up on, and (the run state being read off the cards)
+   * hold the whole turn in "waiting for you" forever.
+   */
+  private trackExtensionUi(
+    dialog: PiExtensionUiDialog,
+    question: PiExtensionUiQuestion | null,
+    card: ChatToolMessage,
+  ): void {
+    this.clearExtensionUi(dialog.id)
+    const timeout =
+      dialog.timeoutMs === null
+        ? null
+        : globalThis.setTimeout(
+            () => this.expireExtensionUi(dialog.id),
+            dialog.timeoutMs,
+          )
+    this.pendingExtensionUi.set(dialog.id, { dialog, question, card, timeout })
+  }
+
+  private expireExtensionUi(id: string): void {
+    const pending = this.pendingExtensionUi.get(id)
+    if (!pending) return
+    this.clearExtensionUi(id)
+    // pi answered for the human: a timed-out confirm is pi's own `false`, and a
+    // timed-out question leaves the extension with no answer at all.
+    this.emit({
+      type: 'message_upsert',
+      message: settlePiExtensionUiCard(
+        pending.card,
+        pending.dialog.method === 'confirm'
+          ? { status: ToolCallResponseStatus.Rejected }
+          : { status: ToolCallResponseStatus.Aborted },
+      ),
+    })
+  }
+
+  private clearExtensionUi(id: string): void {
+    const pending = this.pendingExtensionUi.get(id)
+    if (!pending) return
+    if (pending.timeout !== null) globalThis.clearTimeout(pending.timeout)
+    this.pendingExtensionUi.delete(id)
+  }
+
+  private clearPendingExtensionUi(): void {
+    for (const pending of this.pendingExtensionUi.values()) {
+      if (pending.timeout !== null) globalThis.clearTimeout(pending.timeout)
+    }
+    this.pendingExtensionUi.clear()
+  }
+
+  private sendExtensionUiResponse(response: Record<string, unknown>): void {
+    this.activeHandle?.transport.send(response)
+  }
+
   private async attemptBindSession(): Promise<void> {
     if (this.sessionBound || this.disposed || !this.activeHandle) return
     if (this.bindAttemptInFlight) return this.bindAttemptInFlight

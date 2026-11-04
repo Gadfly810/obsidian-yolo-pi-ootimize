@@ -1,5 +1,6 @@
 import type { App } from 'obsidian'
 
+import { ToolCallResponseStatus } from '../../../types/tool-call.types'
 import type { CliRuntimeEvent } from '../types'
 
 import { PiCliRuntime } from './PiCliRuntime'
@@ -548,5 +549,284 @@ describe('PiCliRuntime — compact', () => {
 
     expect(process.requestsOf('compact')).toHaveLength(1)
     await runtime.dispose()
+  })
+})
+
+describe('PiCliRuntime — extension UI dialogs', () => {
+  const toolCallOf = (events: CliRuntimeEvent[]) => {
+    const cards = events.flatMap((event) =>
+      event.type === 'message_upsert' &&
+      event.message.role === 'tool' &&
+      event.message.toolCalls.length > 0
+        ? [event.message.toolCalls[0]]
+        : [],
+    )
+    return cards[cards.length - 1]
+  }
+
+  it('turns a confirm dialog into an approval card and sends the decision back', async () => {
+    const runtime = createRuntime()
+    const events = collectEvents(runtime)
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-1',
+      method: 'confirm',
+      title: 'Allow this command?',
+      message: 'rm -rf build',
+    })
+
+    const pending = toolCallOf(events)
+    expect(pending.request.metadata?.cliToolCall).toMatchObject({
+      runtimeId: 'pi',
+      name: 'confirm',
+      capability: 'permission_request',
+    })
+    expect(pending.response).toEqual({
+      status: ToolCallResponseStatus.PendingApproval,
+    })
+
+    const settled = await runtime.respondApproval({
+      requestId: 'ui-1',
+      decision: 'approve_once',
+    })
+
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-1',
+      confirmed: true,
+    })
+    expect(settled).toEqual({
+      status: ToolCallResponseStatus.Success,
+      data: { type: 'text', text: '' },
+    })
+    // Answering twice is stale rather than a second response on the wire.
+    expect(
+      await runtime.respondApproval({
+        requestId: 'ui-1',
+        decision: 'reject',
+      }),
+    ).toBeNull()
+    await runtime.dispose()
+  })
+
+  it('declines a confirm dialog when the card is rejected', async () => {
+    const runtime = createRuntime()
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-2',
+      method: 'confirm',
+      title: 'Allow this command?',
+    })
+
+    expect(
+      await runtime.respondApproval({ requestId: 'ui-2', decision: 'reject' }),
+    ).toEqual({ status: ToolCallResponseStatus.Rejected })
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-2',
+      confirmed: false,
+    })
+    await runtime.dispose()
+  })
+
+  it('turns a select dialog into a single-select question card and answers with the offered string', async () => {
+    const runtime = createRuntime()
+    const events = collectEvents(runtime)
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-3',
+      method: 'select',
+      title: 'Which draft?',
+      options: ['Draft A', 'Draft B'],
+    })
+
+    const pending = toolCallOf(events)
+    expect(pending.response).toEqual({
+      status: ToolCallResponseStatus.AwaitingUserInput,
+    })
+    expect(pending.request.metadata?.cliToolCall).toMatchObject({
+      capability: 'user_question',
+      presentationArguments: {
+        questions: [
+          {
+            id: 'extension-ui',
+            prompt: 'Which draft?',
+            inputType: 'single_select',
+            options: [
+              { id: 'Draft A', label: 'Draft A' },
+              { id: 'Draft B', label: 'Draft B' },
+            ],
+          },
+        ],
+      },
+    })
+
+    const settled = await runtime.respondQuestion({
+      requestId: 'ui-3',
+      answer: {
+        type: 'user_answers',
+        answers: [
+          {
+            id: 'extension-ui',
+            question: 'Which draft?',
+            inputType: 'single_select',
+            value: 'Draft B',
+          },
+        ],
+      },
+    })
+
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-3',
+      value: 'Draft B',
+    })
+    expect(settled?.status).toBe(ToolCallResponseStatus.Success)
+    await runtime.dispose()
+  })
+
+  it('falls back to free text for a select dialog with too few options', async () => {
+    const runtime = createRuntime()
+    const events = collectEvents(runtime)
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-4',
+      method: 'select',
+      title: 'Profile?',
+      options: ['default'],
+    })
+
+    const pending = toolCallOf(events)
+    expect(
+      pending.request.metadata?.cliToolCall?.presentationArguments,
+    ).toEqual({
+      questions: [
+        {
+          id: 'extension-ui',
+          prompt: 'Profile?\n\ndefault',
+          inputType: 'free_text',
+        },
+      ],
+    })
+
+    await runtime.respondQuestion({
+      requestId: 'ui-4',
+      answer: {
+        type: 'user_answers',
+        answers: [
+          {
+            id: 'extension-ui',
+            question: 'Profile?',
+            inputType: 'free_text',
+            value: 'custom',
+          },
+        ],
+      },
+    })
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-4',
+      value: 'custom',
+    })
+    await runtime.dispose()
+  })
+
+  it('sends a typed answer that spells an offered option as that option', async () => {
+    const runtime = createRuntime()
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-7',
+      method: 'select',
+      title: 'Allow this command?',
+      options: ['Yes', 'No'],
+    })
+
+    await runtime.respondQuestion({
+      requestId: 'ui-7',
+      answer: {
+        type: 'user_answers',
+        answers: [
+          {
+            id: 'extension-ui',
+            question: 'Allow this command?',
+            inputType: 'single_select',
+            value: '__other__',
+            otherText: 'yes',
+          },
+        ],
+      },
+    })
+
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-7',
+      value: 'Yes',
+    })
+    await runtime.dispose()
+  })
+
+  it('releases a pending dialog when the turn is cancelled', async () => {
+    const runtime = createRuntime()
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    process.emitLine({
+      type: 'extension_ui_request',
+      id: 'ui-5',
+      method: 'input',
+      title: 'Commit message?',
+    })
+
+    await runtime.cancel()
+
+    expect(process.writes).toContainEqual({
+      type: 'extension_ui_response',
+      id: 'ui-5',
+      cancelled: true,
+    })
+    expect(
+      await runtime.respondQuestion({ requestId: 'ui-5', answer: null }),
+    ).toBeNull()
+    await runtime.dispose()
+  })
+
+  it('settles the card itself when the dialog times out', async () => {
+    const runtime = createRuntime()
+    const events = collectEvents(runtime)
+    await runtime.ensureReady({})
+    const process = startedProcesses[0]
+
+    jest.useFakeTimers()
+    try {
+      process.emitLine({
+        type: 'extension_ui_request',
+        id: 'ui-6',
+        method: 'confirm',
+        title: 'Allow this command?',
+        timeout: 5_000,
+      })
+      jest.advanceTimersByTime(5_000)
+      expect(toolCallOf(events).response).toEqual({
+        status: ToolCallResponseStatus.Rejected,
+      })
+    } finally {
+      await runtime.dispose()
+      jest.useRealTimers()
+    }
   })
 })

@@ -327,7 +327,12 @@ const extractPiToolText = (value: unknown): string => {
   return ''
 }
 
-const toolPair = (
+/**
+ * The two messages one tool call needs: the request shell the chat surface
+ * groups by, and the result card that carries the call's response. Exported
+ * for the extension-UI bridge, whose cards are not transcript events.
+ */
+export const toolPair = (
   request: ToolCallRequest,
   response: ToolCallResponse,
 ): [ChatAssistantMessage, ChatToolMessage] => [
